@@ -1,33 +1,19 @@
 /**
  * App.tsx — Root orchestrator for the Hand Tracking Shader App
  *
- * Design Philosophy: Invisible UI — the app is purely visual when active.
- * Loading/error states use a minimal dark overlay. All high-frequency data
- * lives in refs to prevent React re-render loops.
+ * Design: Invisible UI when active. Loading/error states use minimal dark overlay.
+ * All high-frequency data lives in refs to prevent React re-render loops.
  *
- * Architecture:
- *  - Camera init → MediaPipe init → RAF loop
- *  - videoReady + modelReady gates activation
- *  - boxRef: normalized [cx, cy, w, h] for shader
- *  - smoothedBoxRef: lerp-smoothed version of boxRef
- *  - gestureState: state machine for peace/fist gestures
+ * Box format: { xMin, yMin, xMax, yMax } — normalized 0-1 UV coords
+ * Clap gesture: cycles effectIndex forward (effectIndex + 1) % 6
+ * Peace sign: opens effect dropdown
+ * Fist: closes effect dropdown
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
-import EffectsCanvas from "./components/EffectsCanvas";
+import EffectsCanvas, { type BoxRef } from "./components/EffectsCanvas";
 import GestureDropdown from "./components/GestureDropdown";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type AppStatus = "loading-camera" | "loading-model" | "active" | "error";
-
-interface BoxData {
-  cx: number;
-  cy: number;
-  w: number;
-  h: number;
-}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -37,9 +23,14 @@ const CLAP_THRESHOLD = 0.1;
 const CLAP_COOLDOWN_MS = 1000;
 const GESTURE_CONFIRM_MS = 500;
 const GESTURE_COOLDOWN_MS = 500;
+const NUM_EFFECTS = 6;
 
 const MEDIAPIPE_WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type AppStatus = "loading-camera" | "loading-model" | "active" | "error";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -47,14 +38,16 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function lerpBox(prev: BoxData, next: BoxData, t: number): BoxData {
+function lerpBox(prev: BoxRef, next: BoxRef, t: number): BoxRef {
   return {
-    cx: lerp(prev.cx, next.cx, t),
-    cy: lerp(prev.cy, next.cy, t),
-    w: lerp(prev.w, next.w, t),
-    h: lerp(prev.h, next.h, t),
+    xMin: lerp(prev.xMin, next.xMin, t),
+    yMin: lerp(prev.yMin, next.yMin, t),
+    xMax: lerp(prev.xMax, next.xMax, t),
+    yMax: lerp(prev.yMax, next.yMax, t),
   };
 }
+
+const EMPTY_BOX: BoxRef = { xMin: 0, yMin: 0, xMax: 0, yMax: 0 };
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -66,10 +59,13 @@ export default function App() {
   const rafRef = useRef<number>(0);
   const lastDetectTimeRef = useRef<number>(0);
   const lastClapTimeRef = useRef<number>(0);
-  const boxRef = useRef<BoxData>({ cx: 0.5, cy: 0.5, w: 0, h: 0 });
-  const smoothedBoxRef = useRef<BoxData>({ cx: 0.5, cy: 0.5, w: 0, h: 0 });
+  const boxRef = useRef<BoxRef>({ ...EMPTY_BOX });
+  const smoothedBoxRef = useRef<BoxRef>({ ...EMPTY_BOX });
   const videoReadyRef = useRef(false);
   const modelReadyRef = useRef(false);
+
+  // effectIndex as ref for RAF loop (avoids stale closure)
+  const effectIndexRef = useRef(0);
 
   // Gesture state machine refs
   const currentGestureRef = useRef<string | null>(null);
@@ -88,6 +84,11 @@ export default function App() {
   useEffect(() => {
     menuOpenRef.current = menuOpen;
   }, [menuOpen]);
+
+  // Keep effectIndexRef in sync with effectIndex state
+  useEffect(() => {
+    effectIndexRef.current = effectIndex;
+  }, [effectIndex]);
 
   // ── Camera init ───────────────────────────────────────────────────────────
   const initCamera = useCallback(async () => {
@@ -216,12 +217,12 @@ export default function App() {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      canvas.width = width;
-      canvas.height = height;
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
       ctx.clearRect(0, 0, width, height);
 
       // Finger connection pairs
-      const connections = [
+      const connections: [number, number][] = [
         [0, 1], [1, 2], [2, 3], [3, 4],
         [0, 5], [5, 6], [6, 7], [7, 8],
         [5, 9], [9, 10], [10, 11], [11, 12],
@@ -232,8 +233,8 @@ export default function App() {
 
       for (const hand of landmarks) {
         // Draw connections
-        ctx.strokeStyle = "rgba(255,255,255,0.5)";
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.lineWidth = 2;
         for (const [a, b] of connections) {
           const ax = (1 - hand[a].x) * width;
           const ay = hand[a].y * height;
@@ -251,7 +252,7 @@ export default function App() {
           const y = lm.y * height;
           ctx.beginPath();
           ctx.arc(x, y, 3, 0, Math.PI * 2);
-          ctx.fillStyle = "white";
+          ctx.fillStyle = "#ffffff";
           ctx.fill();
         }
       }
@@ -295,7 +296,6 @@ export default function App() {
     const firstHand = landmarks[0] ?? null;
 
     if (!firstHand) {
-      // No hands → reset gesture tracking
       currentGestureRef.current = null;
       gestureStartTimeRef.current = 0;
     } else {
@@ -330,12 +330,8 @@ export default function App() {
 
     if (landmarks.length !== 2) {
       // Hide box when not exactly 2 hands
-      boxRef.current = { cx: 0.5, cy: 0.5, w: 0, h: 0 };
-      smoothedBoxRef.current = lerpBox(
-        smoothedBoxRef.current,
-        boxRef.current,
-        LERP_FACTOR
-      );
+      boxRef.current = { ...EMPTY_BOX };
+      smoothedBoxRef.current = lerpBox(smoothedBoxRef.current, EMPTY_BOX, LERP_FACTOR);
       return;
     }
 
@@ -349,18 +345,23 @@ export default function App() {
     const dy = lm2.y - lm1.y;
     const distance = Math.sqrt(dx * dx + dy * dy);
 
-    // Clap detection
+    // Clap detection — cycle to next effect
     if (
       distance < CLAP_THRESHOLD &&
       now - lastClapTimeRef.current > CLAP_COOLDOWN_MS
     ) {
       lastClapTimeRef.current = now;
-      boxRef.current = { cx: 0, cy: 0, w: 0, h: 0 };
-      smoothedBoxRef.current = { cx: 0, cy: 0, w: 0, h: 0 };
+      // Cycle effect index
+      const nextEffect = (effectIndexRef.current + 1) % NUM_EFFECTS;
+      effectIndexRef.current = nextEffect;
+      setEffectIndex(nextEffect);
+      // Hide box during clap
+      boxRef.current = { ...EMPTY_BOX };
+      smoothedBoxRef.current = { ...EMPTY_BOX };
       return;
     }
 
-    // Compute box
+    // Compute box: center = midpoint, width = distance * 1.2, height = width * 0.8
     const cx = (lm1.x + lm2.x) / 2;
     const cy = (lm1.y + lm2.y) / 2;
     const w = Math.min(1, distance * 1.2);
@@ -369,11 +370,14 @@ export default function App() {
     // Validate (no NaN, no too-small values)
     if (isNaN(cx) || isNaN(cy) || isNaN(w) || isNaN(h) || w < 0.01) return;
 
-    const newBox: BoxData = {
-      cx: Math.max(0, Math.min(1, cx)),
-      cy: Math.max(0, Math.min(1, cy)),
-      w: Math.max(0, Math.min(1, w)),
-      h: Math.max(0, Math.min(1, h)),
+    const halfW = w / 2;
+    const halfH = h / 2;
+
+    const newBox: BoxRef = {
+      xMin: Math.max(0, Math.min(1, cx - halfW)),
+      yMin: Math.max(0, Math.min(1, cy - halfH)),
+      xMax: Math.max(0, Math.min(1, cx + halfW)),
+      yMax: Math.max(0, Math.min(1, cy + halfH)),
     };
 
     boxRef.current = newBox;
@@ -410,10 +414,11 @@ export default function App() {
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black">
-      {/* Hidden video element */}
+      {/* Hidden video element — must be in DOM for VideoTexture to work */}
       <video
         ref={videoRef}
-        className="absolute opacity-0 pointer-events-none"
+        className="absolute"
+        style={{ opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
         playsInline
         muted
       />
@@ -422,7 +427,7 @@ export default function App() {
       {status === "active" && (
         <EffectsCanvas
           videoRef={videoRef}
-          smoothedBoxRef={smoothedBoxRef}
+          boxRef={smoothedBoxRef}
           effectIndex={effectIndex}
         />
       )}
@@ -438,7 +443,6 @@ export default function App() {
       {(status === "loading-camera" || status === "loading-model") && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-black z-50">
           <div className="flex flex-col items-center gap-6">
-            {/* Animated ring */}
             <div className="relative w-20 h-20">
               <div className="absolute inset-0 rounded-full border-2 border-white/10" />
               <div
@@ -485,26 +489,83 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Visible UI overlay (always on top when active) ─────────────────── */}
+      {status === "active" && (
+        <>
+          {/* Effect selector button — always visible for debugging */}
+          <div
+            className="absolute top-4 right-4 z-30 flex items-center gap-2"
+          >
+            {/* Current effect badge */}
+            <div
+              style={{
+                background: "rgba(0,0,0,0.6)",
+                border: "1px solid rgba(255,255,255,0.15)",
+                borderRadius: "6px",
+                padding: "6px 10px",
+                fontFamily: "monospace",
+                fontSize: "11px",
+                color: "rgba(255,255,255,0.6)",
+                letterSpacing: "0.1em",
+              }}
+            >
+              {["BURNING","GLOW","THERMAL","PIXEL","GLITCH","NEON"][effectIndex]}
+            </div>
+
+            {/* Dropdown toggle button */}
+            <button
+              onClick={() => setMenuOpen((v) => !v)}
+              style={{
+                background: menuOpen ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.6)",
+                border: "1px solid rgba(255,255,255,0.2)",
+                borderRadius: "6px",
+                padding: "6px 12px",
+                fontFamily: "monospace",
+                fontSize: "11px",
+                color: "rgba(255,255,255,0.9)",
+                letterSpacing: "0.1em",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                transition: "background 0.15s ease",
+              }}
+            >
+              <span>EFFECTS</span>
+              <span style={{ fontSize: "8px" }}>{menuOpen ? "▲" : "▼"}</span>
+            </button>
+          </div>
+
+          {/* Gesture hint */}
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+            <p
+              style={{
+                color: "rgba(255,255,255,0.2)",
+                fontSize: "11px",
+                fontFamily: "monospace",
+                letterSpacing: "0.15em",
+                textTransform: "uppercase",
+                textAlign: "center",
+              }}
+            >
+              👏 Clap to cycle effect &nbsp;·&nbsp; ✌️ Peace to open menu &nbsp;·&nbsp; ✊ Fist to close
+            </p>
+          </div>
+        </>
+      )}
+
       {/* Gesture-controlled dropdown */}
       {status === "active" && (
         <GestureDropdown
           open={menuOpen}
           onClose={() => setMenuOpen(false)}
           effectIndex={effectIndex}
-          onEffectChange={(idx) => {
+          onEffectChange={(idx: number) => {
             setEffectIndex(idx);
+            effectIndexRef.current = idx;
             setMenuOpen(false);
           }}
         />
-      )}
-
-      {/* Hint overlay (shown when active) */}
-      {status === "active" && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
-          <p className="text-white/20 text-xs font-mono tracking-widest uppercase text-center">
-            ✌️ Peace sign to open menu &nbsp;·&nbsp; 👊 Fist to close
-          </p>
-        </div>
       )}
     </div>
   );
