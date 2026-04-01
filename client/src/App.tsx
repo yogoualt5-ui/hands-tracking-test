@@ -10,10 +10,13 @@
  * Fist: closes effect dropdown
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import EffectsCanvas, { type BoxRef } from "./components/EffectsCanvas";
 import GestureDropdown from "./components/GestureDropdown";
+import GestureControlPanel, { type CustomGesture, type GestureAction } from "./components/GestureControlPanel";
+import { toast, Toaster } from "sonner";
+import { Button } from "./components/ui/button";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -30,7 +33,13 @@ const MEDIAPIPE_WASM_URL =
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type AppStatus = "loading-camera" | "loading-model" | "active" | "error";
+type AppStatus = "loading-camera" | "loading-model" | "active" | "error" | "idle";
+
+interface NormalizedLandmark {
+  x: number;
+  y: number;
+  z: number;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,12 +82,30 @@ export default function App() {
   const confirmedGestureRef = useRef<string | null>(null);
   const lastGestureActionTimeRef = useRef<number>(0);
 
+  // Recording refs
+  const isRecordingRef = useRef(false);
+  const recordingFramesRef = useRef<NormalizedLandmark[][]>([]);
+  const recordingStartTimeRef = useRef(0);
+
   // ── State (minimal — only for UI layer) ───────────────────────────────────
-  const [status, setStatus] = useState<AppStatus>("loading-camera");
+  const [status, setStatus] = useState<AppStatus>("idle");
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [effectIndex, setEffectIndex] = useState(0);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuOpenRef = useRef(false);
+
+  const [mode, setMode] = useState<"UI" | "Gesture">("UI");
+  const [gestures, setGestures] = useState<CustomGesture[]>(() => {
+    const saved = localStorage.getItem("customGestures");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingProgress, setRecordingProgress] = useState(0);
+
+  // Sync gestures to localStorage
+  useEffect(() => {
+    localStorage.setItem("customGestures", JSON.stringify(gestures));
+  }, [gestures]);
 
   // Keep menuOpenRef in sync with menuOpen state
   useEffect(() => {
@@ -172,7 +199,44 @@ export default function App() {
     }
   }, []);
 
-  // ── Finger up detection ───────────────────────────────────────────────────
+  // ── Gesture Normalization ───────────────────────────────────────────────
+  const normalizeLandmarks = useCallback(
+    (landmarks: Array<{ x: number; y: number; z: number }>): NormalizedLandmark[] => {
+      const wrist = landmarks[0];
+      const middleMCP = landmarks[9];
+
+      // Hand size (distance wrist to middle MCP)
+      const handSize = Math.sqrt(
+        Math.pow(middleMCP.x - wrist.x, 2) +
+        Math.pow(middleMCP.y - wrist.y, 2) +
+        Math.pow(middleMCP.z - wrist.z, 2)
+      );
+
+      return landmarks.map((lm) => ({
+        x: (lm.x - wrist.x) / handSize,
+        y: (lm.y - wrist.y) / handSize,
+        z: (lm.z - wrist.z) / handSize,
+      }));
+    },
+    []
+  );
+
+  // ── Gesture Matching ──────────────────────────────────────────────────────
+  const compareGestures = useCallback(
+    (current: NormalizedLandmark[], saved: number[][]): number => {
+      let totalDistance = 0;
+      for (let i = 0; i < 21; i++) {
+        const dx = current[i].x - saved[i][0];
+        const dy = current[i].y - saved[i][1];
+        const dz = current[i].z - saved[i][2];
+        totalDistance += Math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+      return totalDistance / 21; // Average distance per point
+    },
+    []
+  );
+
+  // ── Finger up detection (for built-in gestures) ───────────────────────────
   const isFingerUp = useCallback(
     (
       landmarks: Array<{ x: number; y: number; z: number }>,
@@ -189,6 +253,24 @@ export default function App() {
     (
       landmarks: Array<{ x: number; y: number; z: number }>
     ): string | null => {
+      // 1. Check custom gestures first
+      if (gestures.length > 0) {
+        const normalized = normalizeLandmarks(landmarks);
+        let bestMatch: { id: string; distance: number } | null = null;
+
+        for (const gesture of gestures) {
+          const distance = compareGestures(normalized, gesture.landmarks);
+          if (distance < 0.15) { // Match threshold
+            if (!bestMatch || distance < bestMatch.distance) {
+              bestMatch = { id: gesture.id, distance };
+            }
+          }
+        }
+
+        if (bestMatch) return bestMatch.id;
+      }
+
+      // 2. Fallback to built-in gestures
       const indexUp = isFingerUp(landmarks, 8, 6);
       const middleUp = isFingerUp(landmarks, 12, 10);
       const ringUp = isFingerUp(landmarks, 16, 14);
@@ -202,8 +284,32 @@ export default function App() {
 
       return null;
     },
-    [isFingerUp]
+    [gestures, normalizeLandmarks, compareGestures, isFingerUp]
   );
+
+  // ── Action Execution ──────────────────────────────────────────────────────
+  const executeAction = useCallback((action: GestureAction) => {
+    switch (action) {
+      case "toggleMenu":
+        setMenuOpen((prev) => !prev);
+        break;
+      case "nextEffect":
+        setEffectIndex((prev) => (prev + 1) % NUM_EFFECTS);
+        break;
+      case "previousEffect":
+        setEffectIndex((prev) => (prev - 1 + NUM_EFFECTS) % NUM_EFFECTS);
+        break;
+      case "switchEffect":
+        setEffectIndex((prev) => (prev + 1) % NUM_EFFECTS);
+        break;
+      case "toggleTracking":
+        setMode((prev) => (prev === "UI" ? "Gesture" : "UI"));
+        break;
+      case "resetEffects":
+        setEffectIndex(0);
+        break;
+    }
+  }, []);
 
   // ── Draw 2D overlay ───────────────────────────────────────────────────────
   const drawOverlay = useCallback(
@@ -292,6 +398,73 @@ export default function App() {
     // Draw 2D overlay
     drawOverlay(landmarks, width, height);
 
+    // ── Recording Logic ─────────────────────────────────────────────────────
+    if (isRecordingRef.current) {
+      if (landmarks.length > 1) {
+        // Cancel recording if multiple hands detected
+        isRecordingRef.current = false;
+        setIsRecording(false);
+        setRecordingProgress(0);
+        recordingFramesRef.current = [];
+        toast.error("Recording cancelled: Multiple hands detected");
+        return;
+      }
+
+      const firstHand = landmarks[0];
+      if (firstHand) {
+        const normalized = normalizeLandmarks(firstHand);
+        recordingFramesRef.current.push(normalized);
+        
+        const elapsed = now - recordingStartTimeRef.current;
+        const progress = Math.min(1, elapsed / 1000);
+        setRecordingProgress(progress);
+
+        if (progress >= 1) {
+          // Finish recording
+          isRecordingRef.current = false;
+          setIsRecording(false);
+          setRecordingProgress(0);
+
+          // Average frames
+          const frames = recordingFramesRef.current;
+          const avgLandmarks: number[][] = Array.from({ length: 21 }, () => [0, 0, 0]);
+          
+          for (const frame of frames) {
+            for (let i = 0; i < 21; i++) {
+              avgLandmarks[i][0] += frame[i].x / frames.length;
+              avgLandmarks[i][1] += frame[i].y / frames.length;
+              avgLandmarks[i][2] += frame[i].z / frames.length;
+            }
+          }
+
+          // Check similarity with existing
+          let tooSimilar = false;
+          for (const g of gestures) {
+            if (compareGestures(avgLandmarks.map(l => ({x:l[0], y:l[1], z:l[2]})), g.landmarks) < 0.05) {
+              tooSimilar = true;
+              break;
+            }
+          }
+
+          if (tooSimilar) {
+            toast.warning("Gesture too similar to an existing one");
+          }
+
+          const newGesture: CustomGesture = {
+            id: crypto.randomUUID(),
+            name: `Gesture ${gestures.length + 1}`,
+            landmarks: avgLandmarks,
+            action: "nextEffect",
+          };
+
+          setGestures(prev => [...prev.slice(-9), newGesture]);
+          recordingFramesRef.current = [];
+          toast.success("Gesture recorded successfully");
+        }
+      }
+      return; // Don't run gesture matching while recording
+    }
+
     // ── Gesture state machine (runs on first hand if available) ─────────────
     const firstHand = landmarks[0] ?? null;
 
@@ -307,17 +480,24 @@ export default function App() {
       } else if (
         detected !== null &&
         now - gestureStartTimeRef.current >= GESTURE_CONFIRM_MS &&
-        now - lastGestureActionTimeRef.current >= GESTURE_COOLDOWN_MS
+        now - lastGestureActionTimeRef.current >= 1000 // Cooldown from requirements
       ) {
         // Gesture confirmed — trigger action ONCE
         if (detected !== confirmedGestureRef.current) {
           confirmedGestureRef.current = detected;
           lastGestureActionTimeRef.current = now;
 
-          if (detected === "peace" && !menuOpenRef.current) {
-            setMenuOpen(true);
-          } else if (detected === "fist" && menuOpenRef.current) {
-            setMenuOpen(false);
+          // Check if it's a custom gesture
+          const custom = gestures.find(g => g.id === detected);
+          if (custom) {
+            executeAction(custom.action);
+          } else {
+            // Built-in gestures
+            if (detected === "peace" && !menuOpenRef.current) {
+              setMenuOpen(true);
+            } else if (detected === "fist" && menuOpenRef.current) {
+              setMenuOpen(false);
+            }
           }
         }
       } else if (detected === null) {
@@ -386,7 +566,20 @@ export default function App() {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    initCamera();
+    if (mode === "Gesture" || isRecording) {
+      setStatus("loading-camera");
+      initCamera();
+    } else {
+      // Release camera
+      const video = videoRef.current;
+      if (video?.srcObject) {
+        (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+        video.srcObject = null;
+      }
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      setStatus("idle");
+    }
+
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       const video = videoRef.current;
@@ -394,7 +587,7 @@ export default function App() {
         (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
       }
     };
-  }, [initCamera]);
+  }, [mode, isRecording, initCamera]);
 
   useEffect(() => {
     if (status === "loading-model") {
@@ -411,9 +604,21 @@ export default function App() {
     }
   }, [status, loop]);
 
+  const handleStartRecording = useCallback(() => {
+    if (gestures.length >= 10) {
+      toast.error("Maximum 10 gestures allowed");
+      return;
+    }
+    setIsRecording(true);
+    isRecordingRef.current = true;
+    recordingFramesRef.current = [];
+    recordingStartTimeRef.current = performance.now();
+  }, [gestures.length]);
+
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black">
+      <Toaster position="top-center" theme="dark" />
       {/* Hidden video element — must be in DOM for VideoTexture to work */}
       <video
         ref={videoRef}
@@ -423,8 +628,41 @@ export default function App() {
         muted
       />
 
+      {/* UI Mode: Configuration Panel */}
+      {mode === "UI" && !isRecording && (
+        <div className="absolute inset-0 z-[60] overflow-auto bg-background">
+          <GestureControlPanel
+            isTrackingEnabled={false}
+            onToggleTracking={() => setMode("Gesture")}
+            gestures={gestures}
+            onAddGesture={(g) => setGestures(prev => [...prev, { ...g, id: crypto.randomUUID() }])}
+            onUpdateGesture={(id, updates) => setGestures(prev => prev.map(g => g.id === id ? { ...g, ...updates } : g))}
+            onDeleteGesture={(id) => setGestures(prev => prev.filter(g => g.id !== id))}
+            isRecording={false}
+            onStartRecording={handleStartRecording}
+            recordingProgress={0}
+          />
+        </div>
+      )}
+
+      {/* Recording Overlay */}
+      {isRecording && (
+        <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/80 backdrop-blur-sm">
+          <div className="text-center space-y-4">
+            <div className="text-4xl font-bold text-white mb-8">Recording Gesture...</div>
+            <div className="w-64 h-2 bg-white/20 rounded-full overflow-hidden mx-auto">
+              <div 
+                className="h-full bg-primary transition-all duration-100" 
+                style={{ width: `${recordingProgress * 100}%` }}
+              />
+            </div>
+            <p className="text-white/60 font-mono text-sm">Keep your hand steady in front of the camera</p>
+          </div>
+        </div>
+      )}
+
       {/* WebGL shader canvas (fullscreen) */}
-      {status === "active" && (
+      {(mode === "Gesture" || isRecording) && status === "active" && (
         <EffectsCanvas
           videoRef={videoRef}
           boxRef={smoothedBoxRef}
@@ -433,11 +671,13 @@ export default function App() {
       )}
 
       {/* 2D landmark overlay */}
-      <canvas
-        ref={canvasRef}
-        className="absolute inset-0 w-full h-full pointer-events-none"
-        style={{ zIndex: 10 }}
-      />
+      {(mode === "Gesture" || isRecording) && (
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full pointer-events-none"
+          style={{ zIndex: 10 }}
+        />
+      )}
 
       {/* Loading state */}
       {(status === "loading-camera" || status === "loading-model") && (
@@ -490,8 +730,20 @@ export default function App() {
       )}
 
       {/* ── Visible UI overlay (always on top when active) ─────────────────── */}
-      {status === "active" && (
+      {mode === "Gesture" && status === "active" && (
         <>
+          {/* Back to UI button */}
+          <div className="absolute top-4 left-4 z-30">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              onClick={() => setMode("UI")}
+              className="bg-black/60 border-white/20 text-white hover:bg-white/10"
+            >
+              Back to Settings
+            </Button>
+          </div>
+
           {/* Effect selector button — always visible for debugging */}
           <div
             className="absolute top-4 right-4 z-30 flex items-center gap-2"
@@ -555,7 +807,7 @@ export default function App() {
       )}
 
       {/* Gesture-controlled dropdown */}
-      {status === "active" && (
+      {mode === "Gesture" && status === "active" && (
         <GestureDropdown
           open={menuOpen}
           onClose={() => setMenuOpen(false)}
