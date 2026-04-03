@@ -1,13 +1,11 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "./ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Switch } from "./ui/switch";
-import { Trash2, Camera, Save, Play, Square, Download, Upload } from "lucide-react";
-import { PresetManager } from "@/gesture-engine/gestures/PresetManager";
-import { toast } from "sonner";
+import { Trash2, Camera, Save, Play, Square } from "lucide-react";
 
 export type GestureAction = 
   | "toggleMenu"
@@ -56,48 +54,6 @@ export default function GestureControlPanel({
   onStartRecording,
   recordingProgress,
 }: GestureControlPanelProps) {
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleExport = () => {
-    try {
-      PresetManager.downloadPreset(gestures, "gesture-preset.json", {
-        author: "User",
-        description: "Custom gesture preset",
-        tags: ["custom"],
-      });
-      toast.success("Gestures exported successfully");
-    } catch (err) {
-      toast.error("Failed to export gestures");
-    }
-  };
-
-  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const result = await PresetManager.loadPresetFromFile(file);
-      
-      // Merge with existing gestures
-      for (const gesture of result.gestures) {
-        onAddGesture({
-          name: gesture.name,
-          landmarks: gesture.landmarks,
-          action: gesture.action,
-        });
-      }
-      
-      toast.success(`Imported ${result.gestures.length} gestures`);
-    } catch (err) {
-      toast.error("Failed to import gestures");
-    }
-
-    // Reset file input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
-  };
-
   return (
     <div className="flex flex-col gap-6 p-6 max-w-2xl mx-auto bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 min-h-screen">
       <Card className="border-primary/20 shadow-lg">
@@ -120,36 +76,6 @@ export default function GestureControlPanel({
           </div>
         </CardHeader>
         <CardContent className="space-y-6">
-          {/* Export/Import Controls */}
-          <div className="flex gap-2 pb-4 border-b">
-            <Button
-              onClick={handleExport}
-              disabled={gestures.length === 0}
-              variant="outline"
-              size="sm"
-              className="gap-2"
-            >
-              <Download className="w-4 h-4" />
-              Export Preset
-            </Button>
-            <Button
-              onClick={() => fileInputRef.current?.click()}
-              variant="outline"
-              size="sm"
-              className="gap-2"
-            >
-              <Upload className="w-4 h-4" />
-              Import Preset
-            </Button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".json"
-              onChange={handleImport}
-              className="hidden"
-            />
-          </div>
-
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-semibold">Custom Gestures</h3>
@@ -226,7 +152,6 @@ export default function GestureControlPanel({
             <ul className="list-disc pl-4 space-y-1">
               <li>Max 10 custom gestures allowed.</li>
               <li>Gestures are stored locally in your browser.</li>
-              <li>Export and import presets to share or backup gestures.</li>
               <li>Ensure good lighting when recording and using gestures.</li>
               <li>Gesture Mode hides this UI and enables hand control.</li>
             </ul>
