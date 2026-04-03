@@ -1,14 +1,9 @@
 /**
  * App.tsx — Root orchestrator for the Hand Tracking Shader App
  * 
- * IMPROVEMENTS:
- * 1. Integrated GestureManager with confidence scoring
- * 2. Velocity filtering to prevent ghost triggers
- * 3. Gesture priority system (menu > custom > built-in)
- * 4. Temporal consistency buffer for stable detection
- * 5. Debug HUD for real-time monitoring
- * 6. Smoothing on all transforms (landmarks, box, UI)
- * 7. Frame decoupling (detection ~30 FPS, rendering 60 FPS)
+ * RESTORED:
+ * - Reverted to original hand tracking and gesture detection for better performance and accuracy.
+ * - Maintained architectural improvements: Debug HUD, Preset Sharing, and Modular Structure.
  */
 
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
@@ -17,9 +12,6 @@ import EffectsCanvas, { type BoxRef } from "./components/EffectsCanvas";
 import GestureDropdown from "./components/GestureDropdown";
 import GestureControlPanel, { type CustomGesture, type GestureAction } from "./components/GestureControlPanel";
 import { DebugHUD } from "./gesture-engine/debug/DebugHUD";
-import { GestureManager } from "./gesture-engine/GestureManager";
-import { lerpBox, smoothLandmarks } from "./gesture-engine/processing/smoothing";
-import { calculateBoxFromTwoHands, calculateClapDistance } from "./gesture-engine/processing/boxCalculation";
 import { EngineState, Landmark } from "./gesture-engine/types";
 import { toast, Toaster } from "sonner";
 import { Button } from "./components/ui/button";
@@ -30,6 +22,7 @@ const LERP_FACTOR = 0.2;
 const DETECTION_INTERVAL_MS = 1000 / 30; // ~30 FPS cap
 const CLAP_THRESHOLD = 0.1;
 const CLAP_COOLDOWN_MS = 1000;
+const GESTURE_CONFIRM_MS = 500;
 const NUM_EFFECTS = 6;
 
 const MEDIAPIPE_WASM_URL =
@@ -38,6 +31,29 @@ const MEDIAPIPE_WASM_URL =
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type AppStatus = "loading-camera" | "loading-model" | "active" | "error" | "idle";
+
+interface NormalizedLandmark {
+  x: number;
+  y: number;
+  z: number;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function lerpBox(prev: BoxRef, next: BoxRef, t: number): BoxRef {
+  return {
+    xMin: lerp(prev.xMin, next.xMin, t),
+    yMin: lerp(prev.yMin, next.yMin, t),
+    xMax: lerp(prev.xMax, next.xMax, t),
+    yMax: lerp(prev.yMax, next.yMax, t),
+  };
+}
+
+const EMPTY_BOX: BoxRef = { xMin: 0, yMin: 0, xMax: 0, yMax: 0 };
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -49,8 +65,8 @@ export default function App() {
   const rafRef = useRef<number>(0);
   const lastDetectTimeRef = useRef<number>(0);
   const lastClapTimeRef = useRef<number>(0);
-  const boxRef = useRef<BoxRef>({ xMin: 0, yMin: 0, xMax: 0, yMax: 0 });
-  const smoothedBoxRef = useRef<BoxRef>({ xMin: 0, yMin: 0, xMax: 0, yMax: 0 });
+  const boxRef = useRef<BoxRef>({ ...EMPTY_BOX });
+  const smoothedBoxRef = useRef<BoxRef>({ ...EMPTY_BOX });
   const videoReadyRef = useRef(false);
   const modelReadyRef = useRef(false);
 
@@ -58,14 +74,19 @@ export default function App() {
   const effectIndexRef = useRef(0);
   const menuOpenRef = useRef(false);
   const isRecordingRef = useRef(false);
-  const recordingFramesRef = useRef<Landmark[][]>([]);
+  const recordingFramesRef = useRef<NormalizedLandmark[][]>([]);
   const recordingStartTimeRef = useRef(0);
+
+  // Gesture state machine refs
+  const currentGestureRef = useRef<string | null>(null);
+  const gestureStartTimeRef = useRef<number>(0);
+  const confirmedGestureRef = useRef<string | null>(null);
+  const lastGestureActionTimeRef = useRef<number>(0);
 
   // Debug/Performance
   const fpsRef = useRef(0);
   const frameCountRef = useRef(0);
   const lastFpsTimeRef = useRef(performance.now());
-  const smoothedLandmarksRef = useRef<Landmark[][]>([]);
 
   // ── State (minimal — only for UI layer) ───────────────────────────────────
   const [status, setStatus] = useState<AppStatus>("idle");
@@ -181,6 +202,88 @@ export default function App() {
     }
   }, []);
 
+  // ── Gesture Normalization ───────────────────────────────────────────────
+  const normalizeLandmarks = useCallback(
+    (landmarks: Array<{ x: number; y: number; z: number }>): NormalizedLandmark[] => {
+      const wrist = landmarks[0];
+      const middleMCP = landmarks[9];
+
+      const handSize = Math.sqrt(
+        Math.pow(middleMCP.x - wrist.x, 2) +
+        Math.pow(middleMCP.y - wrist.y, 2) +
+        Math.pow(middleMCP.z - wrist.z, 2)
+      );
+
+      return landmarks.map((lm) => ({
+        x: (lm.x - wrist.x) / handSize,
+        y: (lm.y - wrist.y) / handSize,
+        z: (lm.z - wrist.z) / handSize,
+      }));
+    },
+    []
+  );
+
+  // ── Gesture Matching ──────────────────────────────────────────────────────
+  const compareGestures = useCallback(
+    (current: NormalizedLandmark[], saved: number[][]): number => {
+      let totalDistance = 0;
+      for (let i = 0; i < 21; i++) {
+        const dx = current[i].x - saved[i][0];
+        const dy = current[i].y - saved[i][1];
+        const dz = current[i].z - saved[i][2];
+        totalDistance += Math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+      return totalDistance / 21;
+    },
+    []
+  );
+
+  // ── Finger up detection ───────────────────────────────────────────────────
+  const isFingerUp = useCallback(
+    (
+      landmarks: Array<{ x: number; y: number; z: number }>,
+      tipIdx: number,
+      pipIdx: number
+    ): boolean => {
+      return landmarks[tipIdx].y < landmarks[pipIdx].y;
+    },
+    []
+  );
+
+  // ── Gesture detection ─────────────────────────────────────────────────────
+  const detectGesture = useCallback(
+    (
+      landmarks: Array<{ x: number; y: number; z: number }>
+    ): string | null => {
+      if (gestures.length > 0) {
+        const normalized = normalizeLandmarks(landmarks);
+        let bestMatch: { id: string; distance: number } | null = null;
+
+        for (const gesture of gestures) {
+          const distance = compareGestures(normalized, gesture.landmarks);
+          if (distance < 0.15) {
+            if (!bestMatch || distance < bestMatch.distance) {
+              bestMatch = { id: gesture.id, distance };
+            }
+          }
+        }
+
+        if (bestMatch) return bestMatch.id;
+      }
+
+      const indexUp = isFingerUp(landmarks, 8, 6);
+      const middleUp = isFingerUp(landmarks, 12, 10);
+      const ringUp = isFingerUp(landmarks, 16, 14);
+      const pinkyUp = isFingerUp(landmarks, 20, 18);
+
+      if (indexUp && middleUp && !ringUp && !pinkyUp) return "peace";
+      if (!indexUp && !middleUp && !ringUp && !pinkyUp) return "fist";
+
+      return null;
+    },
+    [gestures, normalizeLandmarks, compareGestures, isFingerUp]
+  );
+
   // ── Action Execution ──────────────────────────────────────────────────────
   const executeAction = useCallback((action: GestureAction) => {
     switch (action) {
@@ -204,169 +307,236 @@ export default function App() {
     }
   }, []);
 
-  const drawOverlay = useCallback((canvas: HTMLCanvasElement, landmarks: Landmark[][]) => {
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+  // ── Draw 2D overlay ───────────────────────────────────────────────────────
+  const drawOverlay = useCallback(
+    (
+      landmarks: Array<Array<{ x: number; y: number; z: number }>>,
+      width: number,
+      height: number
+    ) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "rgba(0, 255, 0, 0.3)";
-    ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-    ctx.lineWidth = 2;
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      ctx.clearRect(0, 0, width, height);
 
-    for (const hand of landmarks) {
-      for (let i = 0; i < hand.length; i++) {
-        const x = hand[i].x * canvas.width;
-        const y = hand[i].y * canvas.height;
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // Draw connections
-      const connections = [
+      const connections: [number, number][] = [
         [0, 1], [1, 2], [2, 3], [3, 4],
         [0, 5], [5, 6], [6, 7], [7, 8],
-        [0, 9], [9, 10], [10, 11], [11, 12],
-        [0, 13], [13, 14], [14, 15], [15, 16],
-        [0, 17], [17, 18], [18, 19], [19, 20],
+        [5, 9], [9, 10], [10, 11], [11, 12],
+        [9, 13], [13, 14], [14, 15], [15, 16],
+        [13, 17], [17, 18], [18, 19], [19, 20],
+        [0, 17],
       ];
 
-      for (const [start, end] of connections) {
-        const x1 = hand[start].x * canvas.width;
-        const y1 = hand[start].y * canvas.height;
-        const x2 = hand[end].x * canvas.width;
-        const y2 = hand[end].y * canvas.height;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-      }
-    }
-  }, []);
+      for (const hand of landmarks) {
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.lineWidth = 2;
+        for (const [a, b] of connections) {
+          const ax = (1 - hand[a].x) * width;
+          const ay = hand[a].y * height;
+          const bx = (1 - hand[b].x) * width;
+          const by = hand[b].y * height;
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(bx, by);
+          ctx.stroke();
+        }
 
-  // ── Main detection loop (decoupled from render) ────────────────────────────
+        for (const lm of hand) {
+          const x = (1 - lm.x) * width;
+          const y = lm.y * height;
+          ctx.beginPath();
+          ctx.arc(x, y, 3, 0, Math.PI * 2);
+          ctx.fillStyle = "#ffffff";
+          ctx.fill();
+        }
+      }
+    },
+    []
+  );
+
+  // ── Main RAF loop ─────────────────────────────────────────────────────────
   const loop = useCallback(() => {
-    if (!videoReadyRef.current || !modelReadyRef.current) {
-      rafRef.current = requestAnimationFrame(loop);
-      return;
-    }
+    rafRef.current = requestAnimationFrame(loop);
+
+    const video = videoRef.current;
+    const landmarker = landmarkerRef.current;
+
+    if (!videoReadyRef.current || !modelReadyRef.current) return;
+    if (!video || !landmarker) return;
+    if (video.readyState !== 4) return;
 
     const now = performance.now();
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
 
-    if (!video || !canvas) {
-      rafRef.current = requestAnimationFrame(loop);
+    if (now - lastDetectTimeRef.current < DETECTION_INTERVAL_MS) return;
+    lastDetectTimeRef.current = now;
+
+    let results;
+    try {
+      results = landmarker.detectForVideo(video, now);
+    } catch {
       return;
     }
 
-    // ── Detection interval (30 FPS) ────────────────────────────────────────
-    if (now - lastDetectTimeRef.current >= DETECTION_INTERVAL_MS) {
-      lastDetectTimeRef.current = now;
+    const landmarks = results.landmarks ?? [];
+    const width = video.videoWidth;
+    const height = video.videoHeight;
 
-      try {
-        const landmarker = landmarkerRef.current;
-        if (!landmarker) {
-          rafRef.current = requestAnimationFrame(loop);
-          return;
-        }
+    drawOverlay(landmarks, width, height);
 
-        const result = landmarker.detectForVideo(video, now);
-        const landmarks: Landmark[][] = result.landmarks.map((hand) =>
-          hand.map((lm) => ({ x: lm.x, y: lm.y, z: lm.z }))
-        );
-
-        // Smoothing
-        if (smoothedLandmarksRef.current.length === 0) {
-          smoothedLandmarksRef.current = landmarks;
-        } else {
-          smoothedLandmarksRef.current = landmarks.map((hand, i) =>
-            smoothLandmarks(hand, smoothedLandmarksRef.current[i] || hand, LERP_FACTOR)
-          );
-        }
-
-        const gestureManager = GestureManager.getInstance();
-
-        // Recording logic
-        if (isRecordingRef.current) {
-          recordingFramesRef.current.push(smoothedLandmarksRef.current[0] || []);
-          const elapsed = now - recordingStartTimeRef.current;
-          const progress = Math.min(elapsed / 2000, 1); // 2 second recording
-          setRecordingProgress(progress);
-
-          if (progress >= 1) {
-            isRecordingRef.current = false;
-            setIsRecording(false);
-            toast.success("Gesture recorded! Configure it in the panel.");
-          }
-        }
-
-        // Gesture detection (only if not recording and in gesture mode)
-        if (!isRecordingRef.current && mode === "Gesture") {
-          if (smoothedLandmarksRef.current.length > 0) {
-            const result = gestureManager.process(
-              smoothedLandmarksRef.current[0],
-              gestures,
-              menuOpenRef.current
-            );
-
-            // Update debug state
-            setDebugState((prev) => ({
-              ...prev,
-              landmarks: smoothedLandmarksRef.current,
-              velocity: gestureManager.getVelocity(),
-              currentGesture: result.id,
-              confidence: result.confidence,
-              isMenuOpen: menuOpenRef.current,
-              effectIndex: effectIndexRef.current,
-            }));
-
-            // Execute confirmed actions
-            if (result.isConfirmed && result.id) {
-              const gesture = gestures.find((g) => g.id === result.id);
-              if (gesture) {
-                executeAction(gesture.action);
-              }
-            }
-          }
-
-          // Clap detection (two hands)
-          if (smoothedLandmarksRef.current.length === 2 && !menuOpenRef.current) {
-            const distance = calculateClapDistance(
-              smoothedLandmarksRef.current[0],
-              smoothedLandmarksRef.current[1]
-            );
-
-            if (distance < CLAP_THRESHOLD && now - lastClapTimeRef.current > CLAP_COOLDOWN_MS) {
-              lastClapTimeRef.current = now;
-              const nextEffect = (effectIndexRef.current + 1) % NUM_EFFECTS;
-              effectIndexRef.current = nextEffect;
-              setEffectIndex(nextEffect);
-              boxRef.current = { xMin: 0, yMin: 0, xMax: 0, yMax: 0 };
-              smoothedBoxRef.current = { xMin: 0, yMin: 0, xMax: 0, yMax: 0 };
-            }
-          }
-
-          // Box calculation (two hands)
-          if (smoothedLandmarksRef.current.length === 2 && !menuOpenRef.current) {
-            const newBox = calculateBoxFromTwoHands(
-              smoothedLandmarksRef.current[0],
-              smoothedLandmarksRef.current[1]
-            );
-            boxRef.current = newBox;
-            smoothedBoxRef.current = lerpBox(smoothedBoxRef.current, newBox, LERP_FACTOR);
-          } else {
-            boxRef.current = { xMin: 0, yMin: 0, xMax: 0, yMax: 0 };
-            smoothedBoxRef.current = lerpBox(smoothedBoxRef.current, boxRef.current, LERP_FACTOR);
-          }
-        }
-
-        // Draw overlay
-        drawOverlay(canvas, smoothedLandmarksRef.current);
-      } catch (err) {
-        console.error("Detection error:", err);
+    // ── Recording Logic ─────────────────────────────────────────────────────
+    if (isRecordingRef.current) {
+      if (landmarks.length > 1) {
+        isRecordingRef.current = false;
+        setIsRecording(false);
+        setRecordingProgress(0);
+        recordingFramesRef.current = [];
+        toast.error("Recording cancelled: Multiple hands detected");
+        return;
       }
+
+      const firstHand = landmarks[0];
+      if (firstHand) {
+        const normalized = normalizeLandmarks(firstHand);
+        recordingFramesRef.current.push(normalized);
+        
+        const elapsed = now - recordingStartTimeRef.current;
+        const progress = Math.min(1, elapsed / 2000); // 2 second recording
+        setRecordingProgress(progress);
+
+        if (progress >= 1) {
+          isRecordingRef.current = false;
+          setIsRecording(false);
+          setRecordingProgress(0);
+
+          const frames = recordingFramesRef.current;
+          const avgLandmarks: number[][] = Array.from({ length: 21 }, () => [0, 0, 0]);
+          
+          for (const frame of frames) {
+            for (let i = 0; i < 21; i++) {
+              avgLandmarks[i][0] += frame[i].x / frames.length;
+              avgLandmarks[i][1] += frame[i].y / frames.length;
+              avgLandmarks[i][2] += frame[i].z / frames.length;
+            }
+          }
+
+          const newGesture: CustomGesture = {
+            id: crypto.randomUUID(),
+            name: `Gesture ${gestures.length + 1}`,
+            landmarks: avgLandmarks,
+            action: "nextEffect",
+          };
+
+          setGestures(prev => [...prev.slice(-9), newGesture]);
+          recordingFramesRef.current = [];
+          toast.success("Gesture recorded successfully");
+        }
+      }
+      return;
     }
+
+    // ── Gesture state machine ───────────────────────────────────────────────
+    const firstHand = landmarks[0] ?? null;
+
+    if (!firstHand) {
+      currentGestureRef.current = null;
+      gestureStartTimeRef.current = 0;
+    } else {
+      const detected = detectGesture(firstHand);
+
+      if (detected !== currentGestureRef.current) {
+        currentGestureRef.current = detected;
+        gestureStartTimeRef.current = now;
+      } else if (
+        detected !== null &&
+        now - gestureStartTimeRef.current >= GESTURE_CONFIRM_MS &&
+        now - lastGestureActionTimeRef.current >= 1000
+      ) {
+        if (detected !== confirmedGestureRef.current) {
+          confirmedGestureRef.current = detected;
+          lastGestureActionTimeRef.current = now;
+
+          const custom = gestures.find(g => g.id === detected);
+          if (custom) {
+            executeAction(custom.action);
+          } else {
+            if (detected === "peace" && !menuOpenRef.current) {
+              setMenuOpen(true);
+            } else if (detected === "fist" && menuOpenRef.current) {
+              setMenuOpen(false);
+            }
+          }
+        }
+      } else if (detected === null) {
+        confirmedGestureRef.current = null;
+      }
+
+      // Update debug state
+      setDebugState((prev) => ({
+        ...prev,
+        landmarks: landmarks.map(h => h.map(l => ({x:l.x, y:l.y, z:l.z}))),
+        currentGesture: detected,
+        confidence: detected ? 1 : 0,
+        isMenuOpen: menuOpenRef.current,
+        effectIndex: effectIndexRef.current,
+      }));
+    }
+
+    // ── Box + clap logic ────────────────────────────────────────────────────
+    if (menuOpenRef.current) return;
+
+    if (landmarks.length !== 2) {
+      boxRef.current = { ...EMPTY_BOX };
+      smoothedBoxRef.current = lerpBox(smoothedBoxRef.current, EMPTY_BOX, LERP_FACTOR);
+      return;
+    }
+
+    const [hand1, hand2] = landmarks;
+    const lm1 = hand1[9];
+    const lm2 = hand2[9];
+
+    if (!lm1 || !lm2) return;
+
+    const dx = lm2.x - lm1.x;
+    const dy = lm2.y - lm1.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    if (
+      distance < CLAP_THRESHOLD &&
+      now - lastClapTimeRef.current > CLAP_COOLDOWN_MS
+    ) {
+      lastClapTimeRef.current = now;
+      const nextEffect = (effectIndexRef.current + 1) % NUM_EFFECTS;
+      effectIndexRef.current = nextEffect;
+      setEffectIndex(nextEffect);
+      boxRef.current = { ...EMPTY_BOX };
+      smoothedBoxRef.current = { ...EMPTY_BOX };
+      return;
+    }
+
+    const cx = (lm1.x + lm2.x) / 2;
+    const cy = (lm1.y + lm2.y) / 2;
+    const w = Math.min(1, distance * 1.2);
+    const h = w * 0.8;
+
+    if (isNaN(cx) || isNaN(cy) || isNaN(w) || isNaN(h) || w < 0.01) return;
+
+    const halfW = w / 2;
+    const halfH = h / 2;
+
+    const newBox: BoxRef = {
+      xMin: Math.max(0, Math.min(1, cx - halfW)),
+      yMin: Math.max(0, Math.min(1, cy - halfH)),
+      xMax: Math.max(0, Math.min(1, cx + halfW)),
+      yMax: Math.max(0, Math.min(1, cy + halfH)),
+    };
+
+    boxRef.current = newBox;
+    smoothedBoxRef.current = lerpBox(smoothedBoxRef.current, newBox, LERP_FACTOR);
 
     // ── FPS calculation ────────────────────────────────────────────────────
     frameCountRef.current++;
@@ -377,9 +547,7 @@ export default function App() {
       lastFpsTimeRef.current = now;
       setDebugState((prev) => ({ ...prev, fps: fpsRef.current }));
     }
-
-    rafRef.current = requestAnimationFrame(loop);
-  }, [mode, gestures, executeAction, drawOverlay]);
+  }, [gestures, detectGesture, executeAction, drawOverlay, normalizeLandmarks]);
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -420,7 +588,6 @@ export default function App() {
     }
   }, [status, loop]);
 
-  // ── Recording handler ───────────────────────────────────────────────────────
   const handleStartRecording = useCallback(() => {
     if (gestures.length >= 10) {
       toast.error("Maximum 10 gestures allowed");
