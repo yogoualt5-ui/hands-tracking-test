@@ -181,6 +181,69 @@ export default function App() {
     }
   }, []);
 
+  // ── Action Execution ──────────────────────────────────────────────────────
+  const executeAction = useCallback((action: GestureAction) => {
+    switch (action) {
+      case "toggleMenu":
+        setMenuOpen((prev) => !prev);
+        break;
+      case "nextEffect":
+        setEffectIndex((prev) => (prev + 1) % NUM_EFFECTS);
+        break;
+      case "previousEffect":
+        setEffectIndex((prev) => (prev - 1 + NUM_EFFECTS) % NUM_EFFECTS);
+        break;
+      case "toggleTracking":
+        setMode((prev) => (prev === "UI" ? "Gesture" : "UI"));
+        break;
+      case "resetEffects":
+        setEffectIndex(0);
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const drawOverlay = useCallback((canvas: HTMLCanvasElement, landmarks: Landmark[][]) => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "rgba(0, 255, 0, 0.3)";
+    ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
+    ctx.lineWidth = 2;
+
+    for (const hand of landmarks) {
+      for (let i = 0; i < hand.length; i++) {
+        const x = hand[i].x * canvas.width;
+        const y = hand[i].y * canvas.height;
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Draw connections
+      const connections = [
+        [0, 1], [1, 2], [2, 3], [3, 4],
+        [0, 5], [5, 6], [6, 7], [7, 8],
+        [0, 9], [9, 10], [10, 11], [11, 12],
+        [0, 13], [13, 14], [14, 15], [15, 16],
+        [0, 17], [17, 18], [18, 19], [19, 20],
+      ];
+
+      for (const [start, end] of connections) {
+        const x1 = hand[start].x * canvas.width;
+        const y1 = hand[start].y * canvas.height;
+        const x2 = hand[end].x * canvas.width;
+        const y2 = hand[end].y * canvas.height;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
+    }
+  }, []);
+
   // ── Main detection loop (decoupled from render) ────────────────────────────
   const loop = useCallback(() => {
     if (!videoReadyRef.current || !modelReadyRef.current) {
@@ -316,69 +379,7 @@ export default function App() {
     }
 
     rafRef.current = requestAnimationFrame(loop);
-  }, [mode, gestures, executeAction]);
-
-  const executeAction = useCallback((action: GestureAction) => {
-    switch (action) {
-      case "toggleMenu":
-        setMenuOpen((prev) => !prev);
-        break;
-      case "nextEffect":
-        setEffectIndex((prev) => (prev + 1) % NUM_EFFECTS);
-        break;
-      case "previousEffect":
-        setEffectIndex((prev) => (prev - 1 + NUM_EFFECTS) % NUM_EFFECTS);
-        break;
-      case "toggleTracking":
-        setMode((prev) => (prev === "UI" ? "Gesture" : "UI"));
-        break;
-      case "resetEffects":
-        setEffectIndex(0);
-        break;
-      default:
-        break;
-    }
-  }, []);
-
-  const drawOverlay = useCallback((canvas: HTMLCanvasElement, landmarks: Landmark[][]) => {
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "rgba(0, 255, 0, 0.3)";
-    ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-    ctx.lineWidth = 2;
-
-    for (const hand of landmarks) {
-      for (let i = 0; i < hand.length; i++) {
-        const x = hand[i].x * canvas.width;
-        const y = hand[i].y * canvas.height;
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // Draw connections
-      const connections = [
-        [0, 1], [1, 2], [2, 3], [3, 4],
-        [0, 5], [5, 6], [6, 7], [7, 8],
-        [0, 9], [9, 10], [10, 11], [11, 12],
-        [0, 13], [13, 14], [14, 15], [15, 16],
-        [0, 17], [17, 18], [18, 19], [19, 20],
-      ];
-
-      for (const [start, end] of connections) {
-        const x1 = hand[start].x * canvas.width;
-        const y1 = hand[start].y * canvas.height;
-        const x2 = hand[end].x * canvas.width;
-        const y2 = hand[end].y * canvas.height;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-      }
-    }
-  }, []);
+  }, [mode, gestures, executeAction, drawOverlay]);
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -419,6 +420,7 @@ export default function App() {
     }
   }, [status, loop]);
 
+  // ── Recording handler ───────────────────────────────────────────────────────
   const handleStartRecording = useCallback(() => {
     if (gestures.length >= 10) {
       toast.error("Maximum 10 gestures allowed");
